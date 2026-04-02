@@ -70,7 +70,14 @@ function log(msg, type = 'info') {
   const t = now.toTimeString().slice(0,8);
   const entry = document.createElement('div');
   entry.className = 'log-entry';
-  entry.innerHTML = `<span class="log-time">${t}</span><span class="log-msg ${type}">${msg}</span>`;
+  const timeSpan = document.createElement('span');
+  timeSpan.className = 'log-time';
+  timeSpan.textContent = t;
+  const msgSpan = document.createElement('span');
+  msgSpan.className = 'log-msg ' + type;
+  msgSpan.textContent = msg;
+  entry.appendChild(timeSpan);
+  entry.appendChild(msgSpan);
   logArea.appendChild(entry);
   logArea.scrollTop = logArea.scrollHeight;
 }
@@ -212,6 +219,9 @@ btnFillForm.addEventListener('click', async () => {
   const result = await chrome.storage.local.get('skills');
   const skills = getSkills(result.skills);
 
+  // Set the auto-continue flag BEFORE injecting (popup survives page refresh)
+  await chrome.storage.local.set({ autoContinueFill: true, autoContinueTabId: tab.id });
+
   try {
     const fillResults = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
@@ -220,23 +230,34 @@ btnFillForm.addEventListener('click', async () => {
     });
 
     const report = fillResults[0]?.result || {};
-    setProgress(100, 'Complete!');
 
-    // Log each step result
-    (report.steps || []).forEach(step => {
-      log(step.msg, step.ok ? 'success' : 'warn');
-    });
+    // If skills were removed and page will refresh, the flag stays set.
+    // Content script will auto-continue after reload.
+    if (report.willRefresh) {
+      setProgress(50, 'Skills trimmed — waiting for page reload…');
+      log('Skills trimmed. Page will reload — auto-continuing…', 'info');
+      // Don't clear the flag — content script needs it after reload
+    } else {
+      // No reload needed — clear the flag
+      await chrome.storage.local.remove(['autoContinueFill', 'autoContinueTabId']);
+      setProgress(100, 'Complete!');
 
-    if (report.errors && report.errors.length) {
-      report.errors.forEach(e => log('⚠ ' + e, 'error'));
+      (report.steps || []).forEach(step => {
+        log(step.msg, step.ok ? 'success' : 'warn');
+      });
+
+      if (report.errors && report.errors.length) {
+        report.errors.forEach(e => log('⚠ ' + e, 'error'));
+      }
+
+      log('Auto-fill complete!', 'success');
+      statusDot.className = 'status-dot active';
     }
 
-    log('Auto-fill complete!', 'success');
-    statusDot.className = 'status-dot active';
-
   } catch (e) {
-    log('Fill error: ' + e.message, 'error');
-    setProgress(0, 'Error occurred');
+    // If the script execution fails (e.g. page refreshed mid-execution), that's expected
+    log('Fill in progress — page may have reloaded. Auto-continue is set.', 'info');
+    setProgress(50, 'Waiting for reload…');
   } finally {
     hideProgress();
     btnFillForm.disabled = false;
@@ -315,12 +336,17 @@ function fillApplicationForm(skills) {
     }
 
     // Strategy 2: scan ALL selects and walk up DOM to find nearby label/text containing hint
+    // Only walk up 3 levels to avoid matching too-broad ancestor containers (e.g. <form>)
     for (const sel of document.querySelectorAll('select')) {
-      // Walk up through ancestors to check for label text
       let node = sel.parentElement;
-      for (let depth = 0; depth < 8 && node; depth++) {
-        const txt = node.textContent?.toLowerCase() || '';
-        if (txt.includes(hint)) {
+      for (let depth = 0; depth < 3 && node; depth++) {
+        // Check direct text of this node (excluding child element text) to avoid false matches
+        const directText = Array.from(node.childNodes)
+          .filter(n => n.nodeType === 3)
+          .map(n => n.textContent).join('').toLowerCase();
+        const labelChild = node.querySelector(':scope > label, :scope > span, :scope > p, :scope > div > label');
+        const labelText = (labelChild?.textContent || '').toLowerCase();
+        if (directText.includes(hint) || labelText.includes(hint)) {
           const result = pickOption(sel, optHint);
           if (result) return true;
         }
@@ -350,30 +376,34 @@ function fillApplicationForm(skills) {
 
   // Pick an option from a native select by text match
   function pickOption(sel, optHint) {
-    // Exact includes match
-    for (const opt of sel.options) {
-      if (opt.text.toLowerCase().includes(optHint)) {
-        sel.value = opt.value;
+    function selectOpt(opt) {
+      sel.value = opt.value;
+      sel.dispatchEvent(new Event('input', { bubbles: true }));
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value')?.set;
+      if (setter) {
+        setter.call(sel, opt.value);
         sel.dispatchEvent(new Event('input', { bubbles: true }));
         sel.dispatchEvent(new Event('change', { bubbles: true }));
-        // Also try the native setter for React/Angular frameworks
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value')?.set;
-        if (setter) {
-          setter.call(sel, opt.value);
-          sel.dispatchEvent(new Event('input', { bubbles: true }));
-          sel.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-        return true;
       }
+      return true;
     }
-    // Partial / fuzzy match
+    // Pass 1: exact match (trimmed, case-insensitive)
     for (const opt of sel.options) {
-      const oText = opt.text.toLowerCase();
-      if (oText.startsWith(optHint) || optHint.startsWith(oText.substring(0, 4))) {
-        sel.value = opt.value;
-        sel.dispatchEvent(new Event('change', { bubbles: true }));
-        return true;
-      }
+      if (opt.text.trim().toLowerCase() === optHint) return selectOpt(opt);
+    }
+    // Pass 2: word-boundary match (avoid "female" matching "male")
+    const wordRe = new RegExp('\\b' + optHint.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i');
+    for (const opt of sel.options) {
+      if (wordRe.test(opt.text)) return selectOpt(opt);
+    }
+    // Pass 3: starts-with match
+    for (const opt of sel.options) {
+      if (opt.text.trim().toLowerCase().startsWith(optHint)) return selectOpt(opt);
+    }
+    // Pass 4: substring match (last resort)
+    for (const opt of sel.options) {
+      if (opt.text.toLowerCase().includes(optHint)) return selectOpt(opt);
     }
     return false;
   }
@@ -424,7 +454,7 @@ function fillApplicationForm(skills) {
       'select',
       '[role="combobox"]', '[role="listbox"]',
       '[class*="dropdown"]', '[class*="Dropdown"]',
-      '[class*="select"]', '[class*="Select"]',
+      '[class*="combobox"]', '[class*="Combobox"]',
       '[class*="combo"]', '[class*="Combo"]',
       '[data-automation-id*="select"]', '[data-automation-id*="dropdown"]',
       'button[aria-haspopup]', '[aria-haspopup="listbox"]',
@@ -480,21 +510,40 @@ function fillApplicationForm(skills) {
       'ul[role="listbox"] li', 'ul li',
     ];
 
+    // Word-boundary regex to avoid e.g. "female" matching "male"
+    const wordRe = new RegExp('\\b' + hint.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i');
+
     let found = false;
+    // Pass 1: exact text match
     for (const sel of optionSelectors) {
-      const opts = document.querySelectorAll(sel);
-      for (const opt of opts) {
-        const text = opt.textContent.trim().toLowerCase();
-        if (text.includes(hint) || hint.includes(text.substring(0, Math.min(text.length, 10)))) {
-          opt.click();
-          opt.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-          opt.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-          await sleep(200);
-          found = true;
-          break;
+      for (const opt of document.querySelectorAll(sel)) {
+        if (opt.textContent.trim().toLowerCase() === hint) {
+          opt.click(); await sleep(200); found = true; break;
         }
       }
       if (found) break;
+    }
+    // Pass 2: word-boundary match
+    if (!found) {
+      for (const sel of optionSelectors) {
+        for (const opt of document.querySelectorAll(sel)) {
+          if (wordRe.test(opt.textContent.trim())) {
+            opt.click(); await sleep(200); found = true; break;
+          }
+        }
+        if (found) break;
+      }
+    }
+    // Pass 3: substring match (last resort)
+    if (!found) {
+      for (const sel of optionSelectors) {
+        for (const opt of document.querySelectorAll(sel)) {
+          if (opt.textContent.trim().toLowerCase().includes(hint)) {
+            opt.click(); await sleep(200); found = true; break;
+          }
+        }
+        if (found) break;
+      }
     }
 
     // If still not found, try typing into an input inside the dropdown (search/filter)
@@ -504,14 +553,10 @@ function fillApplicationForm(skills) {
       if (searchInput) {
         setNativeValue(searchInput, optionText);
         await sleep(500);
-        // Pick the first matching option
         for (const sel of optionSelectors) {
-          const opts = document.querySelectorAll(sel);
-          for (const opt of opts) {
-            if (opt.textContent.trim().toLowerCase().includes(hint)) {
-              opt.click();
-              found = true;
-              break;
+          for (const opt of document.querySelectorAll(sel)) {
+            if (wordRe.test(opt.textContent.trim()) || opt.textContent.trim().toLowerCase() === hint) {
+              opt.click(); found = true; break;
             }
           }
           if (found) break;
@@ -588,6 +633,7 @@ function fillApplicationForm(skills) {
   return (async () => {
 
     // ── STEP 4: Skills — remove extras if >100 shown ──
+    let skillsRemoved = false;
     try {
       const removeButtons = document.querySelectorAll(
         '[class*="skill"] button, [class*="Tag"] button, [aria-label*="remove"], [aria-label*="Remove"], ' +
@@ -602,14 +648,21 @@ function fillApplicationForm(skills) {
         const toRemove = [...indices].map(i => removeButtons[i]);
         for (const btn of toRemove) {
           btn.click();
-          await sleep(100);
+          await sleep(80);
           removed++;
         }
+        skillsRemoved = true;
         logStep(`✓ Removed ${removed} excess skills (limit: 100)`);
       } else {
         logStep('✓ Skills within limit (≤100)');
       }
     } catch (e) { errors.push('Skills trim: ' + e.message); }
+
+    // If skills were removed, page will likely refresh.
+    // Return early — the background script will auto-continue after reload.
+    if (skillsRemoved) {
+      return { steps, errors, willRefresh: true };
+    }
 
     await sleep(400);
 
@@ -634,7 +687,6 @@ function fillApplicationForm(skills) {
               el.click();
             }
             sanctionCB = el;
-            logStep('✓ SAP Sanction consent checkbox ticked');
             break;
           }
         }
@@ -645,7 +697,9 @@ function fillApplicationForm(skills) {
           sanctionCB.dispatchEvent(new Event('change', { bubbles: true }));
         }
         logStep('✓ SAP Sanction consent checkbox ticked');
-      } else if (!sanctionCB) {
+      } else if (sanctionCB) {
+        logStep('✓ SAP Sanction consent checkbox ticked');
+      } else {
         logStep('Sanction checkbox not found on this page', false);
       }
     } catch (e) { errors.push('Sanction checkbox: ' + e.message); }

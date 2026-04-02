@@ -12,9 +12,7 @@
   "host_permissions": [
     "https://career5.successfactors.eu/*",
     "https://*.successfactors.eu/*",
-    "https://*.successfactors.com/*",
-    "https://*.sap.com/*",
-    "<all_urls>"
+    "https://*.successfactors.com/*"
   ],
   "action": {
     "default_popup": "popup.html",
@@ -24,13 +22,15 @@
       "128": "icons/icon128.png"
     }
   },
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
     {
       "matches": [
         "https://career5.successfactors.eu/*",
         "https://*.successfactors.eu/*",
-        "https://*.successfactors.com/*",
-        "https://*.sap.com/*"
+        "https://*.successfactors.com/*"
       ],
       "js": ["content.js"],
       "run_at": "document_idle",
